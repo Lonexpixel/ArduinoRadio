@@ -1,0 +1,111 @@
+#include <Wire.h>
+#include "SparkFun_Qwiic_Keypad_Arduino_Library.h"
+
+KEYPAD keypad1;
+
+// Function prototypes (needed for PlatformIO / standard C++)
+boolean checkEntry();
+void clearEntry();
+void printEntry();
+
+const char keyCode[] = {'6', '7', '6', '7'};
+char userEntry[] = {0, 0, 0, 0};
+boolean userIsActive = false;
+
+#define TIMEOUT 30
+byte timeOutCounter = 0;
+
+byte userEntryIndex = 0;
+
+void setup(void)
+{
+  Serial.begin(9600);
+  Serial.println("Qwiic KeyPad Example 6 - KeyCode");
+
+  if (keypad1.begin() == false)
+  {
+    Serial.println("Keypad does not appear to be connected. Please check wiring. Freezing...");
+    while (1);
+  }
+
+  Serial.print("Initialized. Firmware Version: ");
+  Serial.println(keypad1.getVersion());
+  Serial.println("\n\r\n\rPlease type in the correct 4 digit KeyCode:");
+}
+
+void loop(void)
+{
+  keypad1.updateFIFO();
+  char button = keypad1.getButton();
+
+  if (button == -1)
+  {
+    Serial.println("No keypad detected");
+    delay(1000);
+  }
+  else if (button != 0)
+  {
+    userEntry[userEntryIndex] = button;
+    printEntry();
+
+    userIsActive = true;
+
+    if (checkEntry() == true)
+    {
+      Serial.print("\n\r\n\rKeycode correct. Wahooooooooooo! You did it");
+      clearEntry();
+      userIsActive = false;
+      delay(1000);
+    }
+
+    userEntryIndex++;
+    if (userEntryIndex == sizeof(keyCode)) userEntryIndex = 0;
+
+    timeOutCounter = 0;
+  }
+
+  delay(10);
+
+  timeOutCounter++;
+
+  if ((timeOutCounter == TIMEOUT) && (userIsActive == true))
+  {
+    Serial.println("\n\r\n\rTimed out... try again. Are you sure you should be doing this");
+    timeOutCounter = 0;
+    userEntryIndex = 0;
+    clearEntry();
+    userIsActive = false;
+  }
+}
+
+// Check user entry against keyCode
+boolean checkEntry()
+{
+  for (byte i = 0; i < sizeof(keyCode); i++)
+  {
+    if (userEntry[i] != keyCode[i])
+      return false;
+  }
+  return true;
+}
+
+// Clear entry
+void clearEntry()
+{
+  for (byte i = 0; i < sizeof(userEntry); i++)
+  {
+    userEntry[i] = 0;
+  }
+}
+
+// Print entry
+void printEntry()
+{
+  Serial.println();
+  Serial.print("UserEntry: ");
+  for (byte i = 0; i < sizeof(userEntry); i++)
+  {
+    Serial.print(char(userEntry[i]));
+  }
+  Serial.println();
+}
