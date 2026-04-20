@@ -134,6 +134,11 @@ void ConnectWiFi() {
   web.begin();
 }
 
+void runRadio();
+void updateDisplayScroll();
+void runDisplayStartup();
+void ConnectWiFi();
+
 void setup() {
   Serial.begin(115200);
   pinMode(BUZZ_PIN, OUTPUT);
