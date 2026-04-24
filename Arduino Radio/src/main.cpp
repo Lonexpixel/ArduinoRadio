@@ -21,6 +21,18 @@ BackgroundAudioVoice v[] = {
  
 #include <I2S.h>
 #include <WiFi.h>
+#include <WiFiUpd.h>
+#ifndef STASSID
+#define STASSID "MUSTANG"
+#define STAPSK  ""
+#endif
+
+unsigned int localPort = 8080;
+char packetBuffer[UDP_TX_PACKET_MAX_SIZE + 1];  // buffer to hold incoming packet,
+char ReplyBuffer[] = "acknowledged\r\n";        // a string to send back
+
+WiFiUDP Udp;
+
 #include <HTTPClient.h>
 #include <BackgroundAudio.h>
 #include <WebServer.h>
@@ -41,10 +53,6 @@ const char *pass = "";
 I2S audio(OUTPUT, 26, 21);
 BackgroundAudioMP3Class<RawDataBuffer<STREAMBUFF>> mp3(audio);
  
-// *** FIX: Use a pointer instead of a global instance ***
-// The old "WiFiClientSecure client;" is replaced with a pointer.
-// A fresh instance is allocated each time we reconnect, which prevents
-// stale TLS session state from breaking connections on channel switches.
 WiFiClientSecure *client = nullptr;
  
 String urls[] = {
@@ -52,8 +60,8 @@ String urls[] = {
   "https://live.amperwave.net/direct/townsquare-ktrsfmmp3-ibc3.mp3",
   "https://uzic.ice.infomaniak.ch/uzic-128.mp3"
 };
-float gains[] = {1.0, 0.3, 0.3, 0.3};
- 
+
+
 Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
 uint32_t colors[] = {
   strip.Color(255,255,0),
@@ -73,9 +81,6 @@ WebServer web(80);
  
 int icyMetaInt = 0;
 int icyDataLeft = 0;
-int icyMetadataLeft = 0;
-int gain = 100;
-String status;
 String title;
  
 // --- LED display scrolling state ---
@@ -83,8 +88,8 @@ String displayTitle = "";
 int scrollPos = 0;
 uint32_t lastScrollTime = 0;
 #define SCROLL_DELAY_MS 300
-char displaybuffer[4] = {' ', ' ', ' ', ' '};
- 
+
+
 void updateDisplayScroll() {
   if (displayTitle.length() == 0) return;
   uint32_t now = millis();
@@ -157,13 +162,13 @@ void setup() {
   delay(3000);
   Serial.println("Starting web radio demo...");
  
-  // *** FIX: No longer calling client.setInsecure() here.
-  // setInsecure() is now called on the freshly allocated client inside runRadio().
   mp3.begin();
+  mp3.setGain(1.5);
  
   if (!WiFi.isConnected()) {
     ConnectWiFi();
   }
+  Udp.begin(localPort);
  
   strip.setPixelColor(0, strip.Color(0,255,0));
   strip.setPixelColor(1, strip.Color(255,0,0));
@@ -176,6 +181,26 @@ void setup() {
 int mode = 0;
  
 void loop() {
+
+  int packetSize = Udp.parsePacket();
+if (packetSize) {
+  int len = Udp.read(packetBuffer, UDP_TX_PACKET_MAX_SIZE);
+  if (len > 0) packetBuffer[len] = 0;
+
+  // Act on the command
+  if (strcmp(packetBuffer, "NEXT") == 0) {
+    urlIndex = (urlIndex + 1) % nURLs;
+    url = urls[urlIndex];
+    http.end();
+    displayTitle = "LOADING...";
+    scrollPos = 0;
+    mode = 1;
+  }
+Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+  Udp.write(ReplyBuffer);
+  Udp.endPacket();
+}
+
   static uint8_t lastBigBtn = LOW;
  
   uint8_t curBigBtn = digitalRead(BIG_BTN);
@@ -185,7 +210,6 @@ void loop() {
     delay(300);
     Serial.println("BIG button pressed");
     urlIndex = (urlIndex + 1) % nURLs;
-    mp3.setGain(gains[urlIndex]);
     url = urls[urlIndex];
     strip.setPixelColor(2, colors[urlIndex]);
     strip.setPixelColor(1, strip.Color(0,255,0));
