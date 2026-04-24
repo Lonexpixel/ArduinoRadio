@@ -1,323 +1,228 @@
-#include <BackgroundAudioSpeech.h>
-#include <libespeak-ng/voice/en_029.h>
-#include <libespeak-ng/voice/en_gb_scotland.h>
-#include <libespeak-ng/voice/en_gb_x_gbclan.h>
-#include <libespeak-ng/voice/en_gb_x_gbcwmd.h>
-#include <libespeak-ng/voice/en_gb_x_rp.h>
-#include <libespeak-ng/voice/en.h>
-#include <libespeak-ng/voice/en_shaw.h>
-#include <libespeak-ng/voice/en_us.h>
-#include <libespeak-ng/voice/en_us_nyc.h>
-BackgroundAudioVoice v[] = {
-  voice_en_029,
-  voice_en_gb_scotland,
-  voice_en_gb_x_gbclan,
-  voice_en_gb_x_gbcwmd,
-  voice_en,
-  voice_en_shaw,
-  voice_en_us,
-  voice_en_us_nyc
-};
- 
-#include <I2S.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <BackgroundAudio.h>
-#include <WebServer.h>
-#include <Adafruit_NeoPixel.h>
+#include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include "Adafruit_LEDBackpack.h"
- 
-#define BUZZ_PIN 5
-#define BIG_BTN  22
-#define NEO_PIN 19
-#define NEO_COUNT 5
-#define STREAMBUFF (16 * 1024)
- 
-const char *ssid = "MUSTANG";
-const char *pass = "";
- 
-I2S audio(OUTPUT, 26, 21);
-BackgroundAudioMP3Class<RawDataBuffer<STREAMBUFF>> mp3(audio);
- 
-// *** FIX: Use a pointer instead of a global instance ***
-// The old "WiFiClientSecure client;" is replaced with a pointer.
-// A fresh instance is allocated each time we reconnect, which prevents
-// stale TLS session state from breaking connections on channel switches.
-WiFiClientSecure *client = nullptr;
- 
-String urls[] = {
-  "https://pureplay.cdnstream1.com/6021_128.mp3",
-  "https://live.amperwave.net/direct/townsquare-ktrsfmmp3-ibc3.mp3",
-  "https://uzic.ice.infomaniak.ch/uzic-128.mp3"
-};
-float gains[] = {1.0, 0.3, 0.3, 0.3};
- 
+#include <SPI.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_LSM6DSOX.h>
+#include <Adafruit_NeoPixel.h>
+#include "SparkFun_Qwiic_Keypad_Arduino_Library.h"
+
+#define NEO_PIN 28
+#define NEO_COUNT 1
+
 Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
-uint32_t colors[] = {
-  strip.Color(255,255,0),
-  strip.Color(255,0,255),
-  strip.Color(0,255,255),
-  strip.Color(120,255,85)
+Adafruit_LSM6DSOX imu;
+KEYPAD keypad1;
+
+// -------------------- USERS --------------------
+const char keyCodes[4][4] = {
+  {'6','7','6','7'}, // Mr.Spice
+  {'6','9','6','9'}, // Mr.Riggs
+  {'0','4','2','0'}, // Mr.Cin
+  {'1','1','1','1'}  // Mr.1
 };
- 
-Adafruit_AlphaNum4 alpha4 = Adafruit_AlphaNum4();
- 
-int nURLs = 3;
-int urlIndex = 0;
-String url = urls[urlIndex];
-HTTPClient http;
-uint8_t buff[512];
-WebServer web(80);
- 
-int icyMetaInt = 0;
-int icyDataLeft = 0;
-int icyMetadataLeft = 0;
-int gain = 100;
-String status;
-String title;
- 
-// --- LED display scrolling state ---
-String displayTitle = "";
-int scrollPos = 0;
-uint32_t lastScrollTime = 0;
-#define SCROLL_DELAY_MS 300
-char displaybuffer[4] = {' ', ' ', ' ', ' '};
- 
-void updateDisplayScroll() {
-  if (displayTitle.length() == 0) return;
-  uint32_t now = millis();
-  if (now - lastScrollTime < SCROLL_DELAY_MS) return;
-  lastScrollTime = now;
- 
-  // Pad with spaces so the text scrolls cleanly on and off
-  String padded = "    " + displayTitle + "    ";
-  int len = padded.length();
- 
+
+const char* userNames[4] = {
+  "Mr.Spice",
+  "Mr.Riggs",
+  "Mr.Cin",
+  "Mr.1"
+};
+
+// -------------------- LOGIN STATE --------------------
+char userEntry[4] = {0};
+byte userEntryIndex = 0;
+int currentUser = -1;
+byte starCount = 0;
+
+// -------------------- IMU --------------------
+enum Orientation {
+  ORIENT_LEFT,
+  ORIENT_RIGHT,
+  ORIENT_FRONT,
+  ORIENT_BACK,
+  ORIENT_UNKNOWN
+};
+
+Orientation lastOrientation = ORIENT_UNKNOWN;
+const float THRESHOLD = 2.0;
+
+// -------------------- COLORS --------------------
+uint32_t GREEN  = strip.Color(0,255,0);
+uint32_t BLUE   = strip.Color(0,0,255);
+uint32_t RED    = strip.Color(255,0,0);
+uint32_t YELLOW = strip.Color(255,255,50);
+uint32_t PURPLE = strip.Color(128,0,128);
+uint32_t ORANGE = strip.Color(180,50,0);
+uint32_t OFF    = strip.Color(0,0,0);
+
+// -------------------- USER PATTERNS --------------------
+uint32_t userPatterns[4][4] = {
+  {ORANGE, BLUE, ORANGE, BLUE},     // Mr.Spice (6767)
+  {YELLOW, PURPLE, YELLOW, PURPLE}, // Mr.Riggs (6969)
+  {RED, BLUE, RED, BLUE},           // Mr.Cin (0420)
+  {PURPLE, GREEN, PURPLE, GREEN}    // Mr.1 (1111)
+};
+
+// -------------------- FUNCTIONS --------------------
+void setPixel(uint32_t color) {
+  strip.setPixelColor(0, color);
+  strip.show();
+}
+
+void flashUserPattern(int user) {
   for (int i = 0; i < 4; i++) {
-    int idx = (scrollPos + i) % len;
-    alpha4.writeDigitAscii(i, padded[idx]);
+    setPixel(userPatterns[user][i]);
+    delay(250);
   }
-  alpha4.writeDisplay();
- 
-  scrollPos = (scrollPos + 1) % len;
+  setPixel(OFF);
 }
- 
-void runDisplayStartup() {
-  alpha4.writeDigitRaw(3, 0x0);
-  alpha4.writeDigitRaw(0, 0xFFFF);
-  alpha4.writeDisplay();
-  delay(200);
-  alpha4.writeDigitRaw(0, 0x0);
-  alpha4.writeDigitRaw(1, 0xFFFF);
-  alpha4.writeDisplay();
-  delay(200);
-  alpha4.writeDigitRaw(1, 0x0);
-  alpha4.writeDigitRaw(2, 0xFFFF);
-  alpha4.writeDisplay();
-  delay(200);
-  alpha4.writeDigitRaw(2, 0x0);
-  alpha4.writeDigitRaw(3, 0xFFFF);
-  alpha4.writeDisplay();
-  delay(200);
-  alpha4.clear();
-  alpha4.writeDisplay();
+
+void setOrientationColor(Orientation o) {
+  if (o == ORIENT_LEFT)       setPixel(BLUE);
+  else if (o == ORIENT_RIGHT) setPixel(YELLOW);
+  else if (o == ORIENT_FRONT) setPixel(PURPLE);
+  else if (o == ORIENT_BACK)  setPixel(ORANGE);
+  else                        setPixel(OFF);
 }
- 
-void ConnectWiFi() {
-  Serial.print("Connecting to WiFi...");
-  WiFi.begin(ssid);
-  while (!WiFi.isConnected()) {
-    Serial.print("..");
-    delay(100);
+
+int checkEntry() {
+  for (int user = 0; user < 4; user++) {
+    bool match = true;
+    for (int i = 0; i < 4; i++) {
+      if (userEntry[i] != keyCodes[user][i]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return user;
   }
-  Serial.print("http://");
-  Serial.println(WiFi.localIP());
-  web.begin();
+  return -1;
 }
- 
-void runRadio();
-void updateDisplayScroll();
-void runDisplayStartup();
-void ConnectWiFi();
- 
+
+void clearEntry() {
+  for (int i = 0; i < 4; i++) userEntry[i] = 0;
+}
+
+// -------------------- SETUP --------------------
 void setup() {
   Serial.begin(115200);
-  pinMode(BUZZ_PIN, OUTPUT);
-  pinMode(BIG_BTN, INPUT_PULLUP);
- 
+  delay(1000);
+
+  // 🔥 FIX: Initialize I2C FIRST
+  Wire.begin();
+  delay(100);
+
+  Serial.println("Starting system...");
+
+  // NeoPixel
   strip.begin();
-  strip.setPixelColor(0, strip.Color(255,0,0));
-  strip.show();
- 
-  alpha4.begin(0x70);
-  runDisplayStartup();
- 
-  delay(3000);
-  Serial.println("Starting web radio demo...");
- 
-  // *** FIX: No longer calling client.setInsecure() here.
-  // setInsecure() is now called on the freshly allocated client inside runRadio().
-  mp3.begin();
- 
-  if (!WiFi.isConnected()) {
-    ConnectWiFi();
+  strip.setBrightness(50);
+  setPixel(OFF);
+
+  // IMU
+  if (!imu.begin_I2C(0x6B)) {
+    Serial.println("IMU NOT FOUND");
+    while (1);
   }
- 
-  strip.setPixelColor(0, strip.Color(0,255,0));
-  strip.setPixelColor(1, strip.Color(255,0,0));
-  strip.show();
- 
-  displayTitle = "READY";
-  scrollPos = 0;
+  Serial.println("IMU OK");
+
+  // Keypad
+  if (!keypad1.begin()) {
+    Serial.println("Keypad INIT FAILED");
+  } else {
+    Serial.println("Keypad INIT SUCCESS");
+  }
+
+  Serial.println("System Ready - Awaiting Login");
 }
- 
-int mode = 0;
- 
+
+// -------------------- LOOP --------------------
 void loop() {
-  static uint8_t lastBigBtn = LOW;
- 
-  uint8_t curBigBtn = digitalRead(BIG_BTN);
- 
-  if (!curBigBtn && (curBigBtn != lastBigBtn)) {
-    mode = 1;
-    delay(300);
-    Serial.println("BIG button pressed");
-    urlIndex = (urlIndex + 1) % nURLs;
-    mp3.setGain(gains[urlIndex]);
-    url = urls[urlIndex];
-    strip.setPixelColor(2, colors[urlIndex]);
-    strip.setPixelColor(1, strip.Color(0,255,0));
-    strip.show();
- 
-    // End the HTTP connection. The fresh WiFiClientSecure will be
-    // allocated in runRadio() on the next iteration.
-    http.end();
- 
-    displayTitle = "LOADING...";
-    scrollPos = 0;
-  }
- 
-  if (mode == 1) {
-    runRadio();
-  }
- 
-  updateDisplayScroll();
- 
-  lastBigBtn = curBigBtn;
-}
- 
-void runRadio() {
-  if (!WiFi.isConnected()) {
-    ConnectWiFi();
-    return;
-  }
- 
-  if (!http.connected()) {
-    Serial.printf("(Re)connecting to '%s'...\n", url.c_str());
-    http.end();
- 
-    // *** FIX: Always destroy the old TLS client and allocate a fresh one.
-    // Reusing the same WiFiClientSecure instance across HTTPS connections
-    // leaves stale mbedTLS session state that silently breaks reconnects.
-    if (client != nullptr) {
-      delete client;
-      client = nullptr;
-    }
-    client = new WiFiClientSecure();
-    client->setInsecure();
- 
-    http.begin(*client, url);
-    // *** FIX: Disable connection reuse so each channel switch gets a clean
-    // TCP + TLS handshake with no leftover socket state.
-    http.setReuse(false);
-    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    const char *icyHdrs[] = { "icy-metaint" };
-    http.collectHeaders(icyHdrs, 1);
-    http.addHeader("Icy-MetaData", "1");
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-      http.end();
-      Serial.printf("Can't GET: '%s'\n", url.c_str());
-      delay(1000);
-      return;
-    }
-    if (http.hasHeader("icy-metaint")) {
-      icyMetaInt = http.header("icy-metaint").toInt();
-      icyDataLeft = icyMetaInt;
-    } else {
-      icyMetaInt = 0;
-    }
-  }
- 
-  WiFiClient *stream = http.getStreamPtr();
-  do {
-    size_t httpavail = stream->available();
-    httpavail = std::min(sizeof(buff), httpavail);
-    size_t mp3avail = mp3.availableForWrite();
-    if (!httpavail || !mp3avail) {
-      break;
-    }
-    size_t toRead = std::min(mp3avail, httpavail);
-    if (icyMetaInt) {
-      toRead = std::min(toRead, (size_t)icyDataLeft);
-    }
-    int read = stream->read(buff, toRead);
-    if (read < 0) {
-      return;
-    }
-    mp3.write(buff, read);
- 
-    if (mp3.available() < 1024) {
-      mp3.pause();
-    } else if (mp3.paused() && mp3.available() > (STREAMBUFF / 2)) {
-      mp3.unpause();
-    }
- 
-    icyDataLeft -= read;
-    if (icyMetaInt && !icyDataLeft) {
-      while (!stream->available() && stream->connected()) {
-        delay(1);
-      }
-      if (!stream->connected()) {
+
+  // ----------- KEYPAD -----------
+  keypad1.updateFIFO();
+  char button = keypad1.getButton();
+
+  if (button != 0 && button != -1) {
+
+    Serial.print("Pressed: ");
+    Serial.println(button);
+
+    if (button == '*') {
+      starCount++;
+
+      if (starCount == 3) {
+        if (currentUser != -1) {
+          Serial.print("Logging out ");
+          Serial.println(userNames[currentUser]);
+          currentUser = -1;
+          setPixel(OFF);
+        }
+        clearEntry();
+        userEntryIndex = 0;
+        starCount = 0;
         return;
       }
-      int totalCnt = stream->read() * 16;
-      int cnt = totalCnt;
- 
-      int buffCnt = std::min(sizeof(buff), (size_t)cnt);
-      uint8_t *p = buff;
-      while (buffCnt && stream->connected()) {
-        read = stream->read(p, buffCnt);
-        p += read;
-        buffCnt -= read;
-        cnt -= read;
-      }
- 
-      while (cnt && stream->connected()) {
-        stream->read();
-        cnt--;
-      }
- 
-      if (totalCnt) {
-        buff[std::min(sizeof(buff) - 1, (size_t)totalCnt)] = 0;
-        Serial.printf("md: '%s'\n", buff);
-        char *titlestr = strstr((const char *)buff, "StreamTitle='");
-        if (titlestr) {
-          titlestr += 13;
-          char *end = strchr(titlestr, ';');
-          if (end) {
-            *(end - 1) = 0;
-          }
-          title = titlestr;
- 
-          // Update the LED display with the new track title
-          displayTitle = title;
-          scrollPos = 0;
+
+      clearEntry();
+      userEntryIndex = 0;
+      return;
+    } else {
+      starCount = 0;
+    }
+
+    if (button == '#') {
+      if (currentUser == -1 && userEntryIndex == 4) {
+        int user = checkEntry();
+        if (user != -1) {
+          currentUser = user;
+
+          Serial.print("Welcome ");
+          Serial.println(userNames[user]);
+
+          flashUserPattern(user); // 🎨 login effect
+        } else {
+          Serial.println("Wrong Code");
         }
       }
-      icyDataLeft = icyMetaInt;
+      clearEntry();
+      userEntryIndex = 0;
+      return;
     }
-  } while (true);
+
+    if (currentUser == -1 && userEntryIndex < 4) {
+      userEntry[userEntryIndex++] = button;
+    }
+  }
+
+  // ----------- IMU (ONLY IF LOGGED IN) -----------
+  if (currentUser != -1) {
+
+    sensors_event_t accel, gyro, temp;
+    imu.getEvent(&accel, &gyro, &temp);
+
+    float ax = accel.acceleration.x;
+    float ay = accel.acceleration.y;
+
+    float absX = abs(ax);
+    float absY = abs(ay);
+
+    Orientation current = ORIENT_UNKNOWN;
+
+    if (absX > absY + THRESHOLD)
+      current = (ax > 0) ? ORIENT_RIGHT : ORIENT_LEFT;
+
+    else if (absY > absX + THRESHOLD)
+      current = (ay > 0) ? ORIENT_FRONT : ORIENT_BACK;
+
+    else
+      current = ORIENT_UNKNOWN;
+
+    if (current != lastOrientation) {
+      setOrientationColor(current);
+      lastOrientation = current;
+    }
+  }
+
+  delay(100);
 }
