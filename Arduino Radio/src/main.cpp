@@ -1,313 +1,119 @@
-const char *myserviceuuid = "b44eb0b6-da3c-4ebf-a680-01a487661ac5";
-const char *strDatauuid   = "b44eb0b6-da3c-4ebf-a680-01a487661ac8";
-
-#include <I2S.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <WebServer.h>
+#include <Arduino.h>
+#include <BLE.h>
 #include <Adafruit_NeoPixel.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include "Adafruit_LEDBackpack.h"
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
 
-#define BUZZ_PIN 5
-#define BIG_BTN  22
+// ================= BLE UUIDs (MATCH SENDER) =================
+BLEService service(BLEUUID(String("b44eb0b6-da3c-4ebf-a680-01a487661ac5")));
+
+BLECharacteristic strData(
+  BLEUUID(String("b44eb0b6-da3c-4ebf-a680-01a487661ac8")),
+  BLERead | BLEWrite | BLENotify,
+  "Direction Data"
+);
+
+// ================= HARDWARE =================
 #define NEO_PIN 19
 #define NEO_COUNT 5
-#define STREAMBUFF (16 * 1024)
-
-const char *ssid = "MUSTANG";
-const char *pass = "";
-
-I2S audio(OUTPUT, 26, 21);
-
-WiFiClientSecure *client = nullptr;
-
-String urls[] = {
-  "https://pureplay.cdnstream1.com/6021_128.mp3",
-  "https://live.amperwave.net/direct/townsquare-ktrsfmmp3-ibc3.mp3",
-  "https://uzic.ice.infomaniak.ch/uzic-128.mp3"
-};
 
 Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
-uint32_t colors[] = {
-  strip.Color(255,255,0),
-  strip.Color(255,0,255),
-  strip.Color(0,255,255),
-  strip.Color(120,255,85)
-};
 
-Adafruit_AlphaNum4 alpha4 = Adafruit_AlphaNum4();
+// ================= STATE =================
+bool loggedIn = false;
+String lastCommand = "";
 
-int nURLs = 3;
-int urlIndex = 0;
-String url = urls[urlIndex];
-HTTPClient http;
-uint8_t buff[512];
-WebServer web(80);
+// ================= COLORS =================
+uint32_t BLUE, YELLOW, PURPLE, ORANGE, GREEN, OFF;
 
-int icyMetaInt = 0;
-int icyDataLeft = 0;
-String title;
-
-// --- LED display scrolling state ---
-String displayTitle = "";
-int scrollPos = 0;
-uint32_t lastScrollTime = 0;
-#define SCROLL_DELAY_MS 300
-
-// --- BLE ---
-BLEServer *pServer = nullptr;
-BLECharacteristic *pCharacteristic = nullptr;
-bool deviceConnected = false;
-
-int mode = 0;
-
-class MyCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pChar) {
-    String val = pChar->getValue().c_str();
-    if (val == "NEXT") {
-      urlIndex = (urlIndex + 1) % nURLs;
-      url = urls[urlIndex];
-      http.end();
-      displayTitle = "LOADING...";
-      scrollPos = 0;
-      mode = 1;
-    }
+// ================= HELPERS =================
+void setAll(uint32_t color) {
+  for (int i = 0; i < NEO_COUNT; i++) {
+    strip.setPixelColor(i, color);
   }
-};
-
-void updateDisplayScroll() {
-  if (displayTitle.length() == 0) return;
-  uint32_t now = millis();
-  if (now - lastScrollTime < SCROLL_DELAY_MS) return;
-  lastScrollTime = now;
-
-  String padded = "    " + displayTitle + "    ";
-  int len = padded.length();
-
-  for (int i = 0; i < 4; i++) {
-    int idx = (scrollPos + i) % len;
-    alpha4.writeDigitAscii(i, padded[idx]);
-  }
-  alpha4.writeDisplay();
-
-  scrollPos = (scrollPos + 1) % len;
-}
-
-void runDisplayStartup() {
-  alpha4.writeDigitRaw(3, 0x0);
-  alpha4.writeDigitRaw(0, 0xFFFF);
-  alpha4.writeDisplay();
-  delay(200);
-  alpha4.writeDigitRaw(0, 0x0);
-  alpha4.writeDigitRaw(1, 0xFFFF);
-  alpha4.writeDisplay();
-  delay(200);
-  alpha4.writeDigitRaw(1, 0x0);
-  alpha4.writeDigitRaw(2, 0xFFFF);
-  alpha4.writeDisplay();
-  delay(200);
-  alpha4.writeDigitRaw(2, 0x0);
-  alpha4.writeDigitRaw(3, 0xFFFF);
-  alpha4.writeDisplay();
-  delay(200);
-  alpha4.clear();
-  alpha4.writeDisplay();
-}
-
-void ConnectWiFi() {
-  Serial.print("Connecting to WiFi...");
-  WiFi.begin(ssid);
-  while (!WiFi.isConnected()) {
-    Serial.print("..");
-    delay(100);
-  }
-  Serial.print("http://");
-  Serial.println(WiFi.localIP());
-  web.begin();
-}
-
-void runRadio();
-
-void setup() {
-  Serial.begin(115200);
-  pinMode(BUZZ_PIN, OUTPUT);
-  pinMode(BIG_BTN, INPUT_PULLUP);
-
-  strip.begin();
-  strip.setPixelColor(0, strip.Color(255,0,0));
   strip.show();
-
-  alpha4.begin(0x70);
-  runDisplayStartup();
-
-  delay(3000);
-  Serial.println("Starting web radio demo...");
-
-  mp3.begin();
-  mp3.setGain(1.5);
-
-  if (!WiFi.isConnected()) {
-    ConnectWiFi();
-  }
-
-  // --- BLE setup ---
-  BLEDevice::init("WebRadio");
-  pServer = BLEDevice::createServer();
-  BLEService *pService = pServer->createService(myserviceuuid);
-  pCharacteristic = pService->createCharacteristic(
-    strDatauuid,
-    BLECharacteristic::PROPERTY_WRITE
-  );
-  pCharacteristic->setCallbacks(new MyCallbacks());
-  pService->start();
-  pServer->getAdvertising()->start();
-  Serial.println("BLE ready, advertising as 'WebRadio'");
-
-  strip.setPixelColor(0, strip.Color(0,255,0));
-  strip.setPixelColor(1, strip.Color(255,0,0));
-  strip.show();
-
-  displayTitle = "READY";
-  scrollPos = 0;
 }
 
-void loop() {
-  static uint8_t lastBigBtn = LOW;
+// ================= BLE CALLBACK =================
+void handleBLEWrite(BLECharacteristic *c) {
+  String val = c->getString();
 
-  uint8_t curBigBtn = digitalRead(BIG_BTN);
+  Serial.print("Received: ");
+  Serial.println(val);
 
-  if (!curBigBtn && (curBigBtn != lastBigBtn)) {
-    mode = 1;
-    delay(300);
-    Serial.println("BIG button pressed");
-    urlIndex = (urlIndex + 1) % nURLs;
-    url = urls[urlIndex];
-    strip.setPixelColor(2, colors[urlIndex]);
-    strip.setPixelColor(1, strip.Color(0,255,0));
-    strip.show();
-    http.end();
-    displayTitle = "LOADING...";
-    scrollPos = 0;
-  }
+  // Prevent spam duplicates
+  if (val == lastCommand) return;
+  lastCommand = val;
 
-  if (mode == 1) {
-    runRadio();
-  }
-
-  updateDisplayScroll();
-
-  lastBigBtn = curBigBtn;
-}
-
-void runRadio() {
-  if (!WiFi.isConnected()) {
-    ConnectWiFi();
+  // ---------- LOGIN ----------
+  if (val == "LOGIN") {
+    loggedIn = true;
+    Serial.println("User Logged In");
+    setAll(GREEN);
     return;
   }
 
-  if (!http.connected()) {
-    Serial.printf("(Re)connecting to '%s'...\n", url.c_str());
-    http.end();
-
-    if (client != nullptr) {
-      delete client;
-      client = nullptr;
-    }
-    client = new WiFiClientSecure();
-    client->setInsecure();
-
-    http.begin(*client, url);
-    http.setReuse(false);
-    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    const char *icyHdrs[] = { "icy-metaint" };
-    http.collectHeaders(icyHdrs, 1);
-    http.addHeader("Icy-MetaData", "1");
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-      http.end();
-      Serial.printf("Can't GET: '%s'\n", url.c_str());
-      delay(1000);
-      return;
-    }
-    if (http.hasHeader("icy-metaint")) {
-      icyMetaInt = http.header("icy-metaint").toInt();
-      icyDataLeft = icyMetaInt;
-    } else {
-      icyMetaInt = 0;
-    }
+  // ---------- LOGOUT ----------
+  if (val == "LOGOUT") {
+    loggedIn = false;
+    Serial.println("User Logged Out");
+    setAll(OFF);
+    return;
   }
 
-  WiFiClient *stream = http.getStreamPtr();
-  do {
-    size_t httpavail = stream->available();
-    httpavail = std::min(sizeof(buff), httpavail);
-    size_t mp3avail = mp3.availableForWrite();
-    if (!httpavail || !mp3avail) {
-      break;
-    }
-    size_t toRead = std::min(mp3avail, httpavail);
-    if (icyMetaInt) {
-      toRead = std::min(toRead, (size_t)icyDataLeft);
-    }
-    int read = stream->read(buff, toRead);
-    if (read < 0) {
-      return;
-    }
-    mp3.write(buff, read);
+  // Ignore if not logged in
+  if (!loggedIn) return;
 
-    if (mp3.available() < 1024) {
-      mp3.pause();
-    } else if (mp3.paused() && mp3.available() > (STREAMBUFF / 2)) {
-      mp3.unpause();
-    }
+  // ---------- DIRECTIONS ----------
+  if (val == "LEFT") {
+    setAll(BLUE);
+  }
+  else if (val == "RIGHT") {
+    setAll(YELLOW);
+  }
+  else if (val == "FRONT") {
+    setAll(PURPLE);
+  }
+  else if (val == "BACK") {
+    setAll(ORANGE);
+  }
+}
 
-    icyDataLeft -= read;
-    if (icyMetaInt && !icyDataLeft) {
-      while (!stream->available() && stream->connected()) {
-        delay(1);
-      }
-      if (!stream->connected()) {
-        return;
-      }
-      int totalCnt = stream->read() * 16;
-      int cnt = totalCnt;
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
 
-      int buffCnt = std::min(sizeof(buff), (size_t)cnt);
-      uint8_t *p = buff;
-      while (buffCnt && stream->connected()) {
-        read = stream->read(p, buffCnt);
-        p += read;
-        buffCnt -= read;
-        cnt -= read;
-      }
+  Serial.println("Receiver Starting...");
 
-      while (cnt && stream->connected()) {
-        stream->read();
-        cnt--;
-      }
+  // NeoPixel
+  strip.begin();
+  strip.setBrightness(50);
 
-      if (totalCnt) {
-        buff[std::min(sizeof(buff) - 1, (size_t)totalCnt)] = 0;
-        Serial.printf("md: '%s'\n", buff);
-        char *titlestr = strstr((const char *)buff, "StreamTitle='");
-        if (titlestr) {
-          titlestr += 13;
-          char *end = strchr(titlestr, ';');
-          if (end) {
-            *(end - 1) = 0;
-          }
-          title = titlestr;
-          displayTitle = title;
-          scrollPos = 0;
-        }
-      }
-      icyDataLeft = icyMetaInt;
-    }
-  } while (true);
+  BLUE   = strip.Color(0,0,255);
+  YELLOW = strip.Color(255,255,0);
+  PURPLE = strip.Color(128,0,128);
+  ORANGE = strip.Color(255,140,0);
+  GREEN  = strip.Color(0,255,0);
+  OFF    = strip.Color(0,0,0);
+
+  setAll(OFF);
+
+  // BLE INIT (PICO CORRECT WAY)
+  BLE.setSecurity(BLESecurityJustWorks);
+  BLE.begin("ReceiverBoard");
+
+  service.addCharacteristic(&strData);
+  BLE.server()->addService(&service);
+
+  strData.setValue("READY");
+
+  strData.onWrite(handleBLEWrite);
+
+  BLE.startAdvertising();
+
+  Serial.println("BLE Ready - Waiting for sender...");
+}
+
+// ================= LOOP =================
+void loop() {
+  delay(10);
 }
