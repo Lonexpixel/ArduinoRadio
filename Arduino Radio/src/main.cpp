@@ -24,22 +24,40 @@ BLECharacteristic strData(
   "Direction Data"
 );
 
+// ================= CONNECTION STATE =================
+bool isConnected = false;
+
+// ✅ BLE CALLBACKS (THIS FIXES CONNECTION STATUS)
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    isConnected = true;
+    Serial.println("\n✅ CONNECTED");
+    strip.setPixelColor(0, strip.Color(0,255,0)); // GREEN
+    strip.show();
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    isConnected = false;
+    Serial.println("\n❌ DISCONNECTED");
+    strip.setPixelColor(0, strip.Color(255,0,0)); // RED
+    strip.show();
+
+    BLE.startAdvertising(); // 🔥 IMPORTANT: allow reconnect
+  }
+};
+
 // ================= USERS =================
 const char keyCodes[4][4] = {
-  {'6','7','6','7'}, // Mr.Spice
-  {'6','9','6','9'}, // Mr.Riggs
-  {'0','4','2','0'}, // Mr.Cin
-  {'1','1','1','1'}  // Mr.1
+  {'6','7','6','7'},
+  {'6','9','6','9'},
+  {'0','4','2','0'},
+  {'1','1','1','1'}
 };
 
 const char* userNames[4] = {
-  "Mr.Spice",
-  "Mr.Riggs",
-  "Mr.Cin",
-  "Mr.1"
+  "Mr.Spice","Mr.Riggs","Mr.Cin","Mr.1"
 };
 
-// ================= LOGIN STATE =================
 char userEntry[4] = {0};
 byte userEntryIndex = 0;
 int currentUser = -1;
@@ -48,22 +66,14 @@ byte starCount = 0;
 // ================= COLORS =================
 uint32_t GREEN, BLUE, RED, YELLOW, PURPLE, ORANGE, OFF;
 
-// ================= PATTERNS =================
-uint32_t userPatterns[4][4];
-
 // ================= IMU =================
 enum Orientation {
-  ORIENT_LEFT,
-  ORIENT_RIGHT,
-  ORIENT_FRONT,
-  ORIENT_BACK,
-  ORIENT_UNKNOWN
+  ORIENT_LEFT, ORIENT_RIGHT, ORIENT_FRONT, ORIENT_BACK, ORIENT_UNKNOWN
 };
 
 Orientation lastOrientation = ORIENT_UNKNOWN;
 const float THRESHOLD = 2.0;
 
-// ✅ NEW: debounce timing
 unsigned long lastSendTime = 0;
 const unsigned long SEND_COOLDOWN = 500;
 
@@ -73,53 +83,27 @@ void setPixel(uint32_t color) {
   strip.show();
 }
 
-void flashUserPattern(int user) {
-  for (int i = 0; i < 4; i++) {
-    setPixel(userPatterns[user][i]);
-    delay(250);
-  }
-  setPixel(OFF);
-}
-
 void sendDirection(const char* dir) {
   strData.setValue(dir);
-  Serial.print("Sent: ");
+  Serial.print("📡 Sent: ");
   Serial.println(dir);
 }
 
 void setOrientationColor(Orientation o) {
-  if (o == ORIENT_LEFT) {
-    setPixel(BLUE);
-    sendDirection("LEFT");
-  }
-  else if (o == ORIENT_RIGHT) {
-    setPixel(YELLOW);
-    sendDirection("RIGHT");
-  }
-  else if (o == ORIENT_FRONT) {
-    setPixel(PURPLE);
-    sendDirection("FRONT");
-  }
-  else if (o == ORIENT_BACK) {
-    setPixel(ORANGE);
-    sendDirection("BACK");
-  }
-  else {
-    setPixel(OFF);
-  }
+  if (o == ORIENT_LEFT)  { setPixel(BLUE);   sendDirection("LEFT"); }
+  if (o == ORIENT_RIGHT) { setPixel(YELLOW); sendDirection("RIGHT"); }
+  if (o == ORIENT_FRONT) { setPixel(PURPLE); sendDirection("FRONT"); }
+  if (o == ORIENT_BACK)  { setPixel(ORANGE); sendDirection("BACK"); }
 }
 
 // ================= LOGIN =================
 int checkEntry() {
-  for (int user = 0; user < 4; user++) {
+  for (int u = 0; u < 4; u++) {
     bool match = true;
     for (int i = 0; i < 4; i++) {
-      if (userEntry[i] != keyCodes[user][i]) {
-        match = false;
-        break;
-      }
+      if (userEntry[i] != keyCodes[u][i]) match = false;
     }
-    if (match) return user;
+    if (match) return u;
   }
   return -1;
 }
@@ -135,42 +119,30 @@ void setup() {
 
   Wire.begin();
 
-  // NeoPixel
   strip.begin();
   strip.setBrightness(50);
 
-  // Colors
   GREEN  = strip.Color(0,255,0);
-  BLUE   = strip.Color(0,0,255);
   RED    = strip.Color(255,0,0);
-  YELLOW = strip.Color(255,255,50);
+  BLUE   = strip.Color(0,0,255);
+  YELLOW = strip.Color(255,255,0);
   PURPLE = strip.Color(128,0,128);
   ORANGE = strip.Color(180,50,0);
   OFF    = strip.Color(0,0,0);
 
-  // Patterns
-  uint32_t temp[4][4] = {
-    {ORANGE, BLUE, ORANGE, BLUE},
-    {YELLOW, PURPLE, YELLOW, PURPLE},
-    {RED, BLUE, RED, BLUE},
-    {PURPLE, GREEN, PURPLE, GREEN}
-  };
-  memcpy(userPatterns, temp, sizeof(temp));
+  setPixel(RED); // waiting
 
-  setPixel(OFF);
-
-  // IMU
   if (!imu.begin_I2C(0x6B)) {
-    Serial.println("IMU NOT FOUND");
-    while (1);
+    Serial.println("IMU FAIL");
+    while(1);
   }
 
-  // Keypad
   keypad1.begin();
 
-  // BLE
   BLE.setSecurity(BLESecurityJustWorks);
   BLE.begin("Dr.Spice");
+
+  BLE.server()->setCallbacks(new MyServerCallbacks());
 
   service.addCharacteristic(&strData);
   BLE.server()->addService(&service);
@@ -179,7 +151,7 @@ void setup() {
 
   BLE.startAdvertising();
 
-  Serial.println("System Ready - Login Required");
+  Serial.println("🔍 Waiting for connection...");
 }
 
 // ================= LOOP =================
@@ -194,12 +166,12 @@ void loop() {
     Serial.print("Pressed: ");
     Serial.println(button);
 
-    // LOGOUT (***)
+    // LOGOUT ***
     if (button == '*') {
       starCount++;
 
       if (starCount == 3) {
-        Serial.println("Logging out");
+        Serial.println("🚪 LOGGING OUT");
         currentUser = -1;
         setPixel(OFF);
         strData.setValue("LOGOUT");
@@ -212,26 +184,33 @@ void loop() {
 
       clearEntry();
       userEntryIndex = 0;
+      Serial.println("🔄 Entry Cleared");
       return;
     } else {
       starCount = 0;
     }
 
-    // SUBMIT (#)
+    // SUBMIT #
     if (button == '#') {
+
+      Serial.print("Entered Code: ");
+      for (int i = 0; i < userEntryIndex; i++) {
+        Serial.print(userEntry[i]);
+      }
+      Serial.println();
+
       if (currentUser == -1 && userEntryIndex == 4) {
         int user = checkEntry();
 
         if (user != -1) {
           currentUser = user;
-
-          Serial.print("Welcome ");
+          Serial.print("✅ LOGIN SUCCESS: ");
           Serial.println(userNames[user]);
 
-          flashUserPattern(user);
           strData.setValue("LOGIN");
+          setPixel(GREEN);
         } else {
-          Serial.println("Wrong Code");
+          Serial.println("❌ WRONG CODE");
         }
       }
 
@@ -243,11 +222,17 @@ void loop() {
     // STORE DIGITS
     if (currentUser == -1 && userEntryIndex < 4) {
       userEntry[userEntryIndex++] = button;
+
+      Serial.print("Typing: ");
+      for (int i = 0; i < userEntryIndex; i++) {
+        Serial.print("*"); // hide actual digits
+      }
+      Serial.println();
     }
   }
 
   // ---------- IMU ----------
-  if (currentUser != -1) {
+  if (currentUser != -1 && isConnected) {
 
     sensors_event_t accel, gyro, temp;
     imu.getEvent(&accel, &gyro, &temp);
@@ -255,23 +240,18 @@ void loop() {
     float ax = accel.acceleration.x;
     float ay = accel.acceleration.y;
 
-    float absX = abs(ax);
-    float absY = abs(ay);
-
     Orientation current = ORIENT_UNKNOWN;
 
-    if (absX > absY + THRESHOLD)
+    if (abs(ax) > abs(ay) + THRESHOLD)
       current = (ax > 0) ? ORIENT_RIGHT : ORIENT_LEFT;
-
-    else if (absY > absX + THRESHOLD)
+    else if (abs(ay) > abs(ax) + THRESHOLD)
       current = (ay > 0) ? ORIENT_FRONT : ORIENT_BACK;
 
     unsigned long now = millis();
 
-    // ✅ FIXED: debounce + ignore UNKNOWN
     if (current != ORIENT_UNKNOWN &&
         current != lastOrientation &&
-        (now - lastSendTime > SEND_COOLDOWN)) {
+        now - lastSendTime > SEND_COOLDOWN) {
 
       setOrientationColor(current);
       lastOrientation = current;
@@ -279,5 +259,5 @@ void loop() {
     }
   }
 
-  delay(100);
+  delay(50);
 }
