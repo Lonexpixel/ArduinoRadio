@@ -1,23 +1,4 @@
-#include <BackgroundAudioSpeech.h>
-#include <libespeak-ng/voice/en_029.h>
-#include <libespeak-ng/voice/en_gb_scotland.h>
-#include <libespeak-ng/voice/en_gb_x_gbclan.h>
-#include <libespeak-ng/voice/en_gb_x_gbcwmd.h>
-#include <libespeak-ng/voice/en_gb_x_rp.h>
-#include <libespeak-ng/voice/en.h>
-#include <libespeak-ng/voice/en_shaw.h>
-#include <libespeak-ng/voice/en_us.h>
-#include <libespeak-ng/voice/en_us_nyc.h>
-BackgroundAudioVoice v[] = {
-  voice_en_029,
-  voice_en_gb_scotland,
-  voice_en_gb_x_gbclan,
-  voice_en_gb_x_gbcwmd,
-  voice_en,
-  voice_en_shaw,
-  voice_en_us,
-  voice_en_us_nyc
-};
+
  
 #include <I2S.h>
 #include <WiFi.h>
