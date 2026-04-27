@@ -2,14 +2,9 @@
 #include <BLE.h>
 #include <Adafruit_NeoPixel.h>
 
-// ================= BLE UUIDs (MATCH SENDER) =================
-BLEService service(BLEUUID(String("b44eb0b6-da3c-4ebf-a680-01a487661ac5")));
-
-BLECharacteristic strData(
-  BLEUUID(String("b44eb0b6-da3c-4ebf-a680-01a487661ac8")),
-  BLERead | BLEWrite | BLENotify,
-  "Direction Data"
-);
+// ================= UUIDs (FROM YOUR FIRST FILE) =================
+const char *serviceUUID = "b44eb0b6-da3c-4ebf-a680-01a487661ac5";
+const char *strDataUUID = "b44eb0b6-da3c-4ebf-a680-01a487661ac8";
 
 // ================= HARDWARE =================
 #define NEO_PIN 19
@@ -32,18 +27,14 @@ void setAll(uint32_t color) {
   strip.show();
 }
 
-// ================= BLE CALLBACK =================
-void handleBLEWrite(BLECharacteristic *c) {
-  String val = c->getString();
-
+// ================= COMMAND HANDLER =================
+void handleCommand(String val) {
   Serial.print("Received: ");
   Serial.println(val);
 
-  // Prevent spam duplicates
   if (val == lastCommand) return;
   lastCommand = val;
 
-  // ---------- LOGIN ----------
   if (val == "LOGIN") {
     loggedIn = true;
     Serial.println("User Logged In");
@@ -51,7 +42,6 @@ void handleBLEWrite(BLECharacteristic *c) {
     return;
   }
 
-  // ---------- LOGOUT ----------
   if (val == "LOGOUT") {
     loggedIn = false;
     Serial.println("User Logged Out");
@@ -59,32 +49,33 @@ void handleBLEWrite(BLECharacteristic *c) {
     return;
   }
 
-  // Ignore if not logged in
   if (!loggedIn) return;
 
-  // ---------- DIRECTIONS ----------
-  if (val == "LEFT") {
-    setAll(BLUE);
-  }
-  else if (val == "RIGHT") {
-    setAll(YELLOW);
-  }
-  else if (val == "FRONT") {
-    setAll(PURPLE);
-  }
-  else if (val == "BACK") {
-    setAll(ORANGE);
-  }
+  if (val == "LEFT") setAll(BLUE);
+  else if (val == "RIGHT") setAll(YELLOW);
+  else if (val == "FRONT") setAll(PURPLE);
+  else if (val == "BACK") setAll(ORANGE);
 }
 
-// ================= SETUP =================
+// ================= NOTIFY CALLBACK =================
+void notify(BLERemoteCharacteristic *c, const uint8_t *data, uint32_t len) {
+  String val = "";
+  for (uint32_t i = 0; i < len; i++) {
+    val += (char)data[i];
+  }
+
+  handleCommand(val);
+}
+
+uint32_t cnt = 1;
+
 void setup() {
   Serial.begin(115200);
-  delay(2000);
+  delay(3000);
 
-  Serial.println("Receiver Starting...");
+  Serial.println("Client Receiver Starting...");
 
-  // NeoPixel
+  // NeoPixel init
   strip.begin();
   strip.setBrightness(50);
 
@@ -97,23 +88,65 @@ void setup() {
 
   setAll(OFF);
 
-  // BLE INIT (PICO CORRECT WAY)
-  BLE.setSecurity(BLESecurityJustWorks);
-  BLE.begin("ReceiverBoard");
-
-  service.addCharacteristic(&strData);
-  BLE.server()->addService(&service);
-
-  strData.setValue("READY");
-
-  strData.onWrite(handleBLEWrite);
-
-  BLE.startAdvertising();
-
-  Serial.println("BLE Ready - Waiting for sender...");
+  // BLE as CLIENT
+  BLE.begin();
+  Serial.println("BLE Client started");
 }
 
-// ================= LOOP =================
 void loop() {
-  delay(10);
+  Serial.printf("Scanning %d...\n", cnt++);
+
+  auto report = BLE.scan(BLEUUID(serviceUUID), 5);
+
+  if (report->empty()) {
+    Serial.println("No devices found, retrying...");
+    delay(3000);
+    return;
+  }
+
+  BLEAdvertising device = report->front();
+
+  Serial.print("Connecting to: ");
+  Serial.println(device.toString());
+
+  if (!BLE.client()->connect(device, 10)) {
+    Serial.println("Connection failed");
+    delay(3000);
+    return;
+  }
+
+  Serial.println("CONNECTED");
+
+  auto svc = BLE.client()->service(BLEUUID(serviceUUID));
+  if (!svc) {
+    Serial.println("Service not found");
+    BLE.client()->disconnect();
+    return;
+  }
+
+  auto strData = svc->characteristic(BLEUUID(strDataUUID));
+  if (!strData) {
+    Serial.println("Characteristic not found");
+    BLE.client()->disconnect();
+    return;
+  }
+
+  // Enable notifications
+  Serial.println("Enabling notifications...");
+  strData->onNotify(notify);
+  strData->enableNotifications();
+
+  // Initial read (optional)
+  String initial = strData->getString();
+  if (initial.length()) {
+    handleCommand(initial);
+  }
+
+  // Stay connected and receive data
+  while (BLE.client()->connected()) {
+    delay(100);
+  }
+
+  Serial.println("DISCONNECTED");
+  delay(2000);
 }
