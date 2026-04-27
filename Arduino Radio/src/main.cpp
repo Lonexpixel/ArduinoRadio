@@ -1,10 +1,13 @@
 #include <Arduino.h>
 #include <BLE.h>
-#include <Adafruit_NeoPixel.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_LEDBackpack.h>
 
 #include <I2S.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <BackgroundAudio.h>
 
 // ================= WIFI =================
@@ -23,6 +26,9 @@ BackgroundAudioMP3Class<RawDataBuffer<STREAMBUFF>> mp3(audio);
 WiFiClientSecure *client = nullptr;
 HTTPClient http;
 uint8_t buff[512];
+
+// ================= DISPLAY =================
+Adafruit_AlphaNum4 alpha4 = Adafruit_AlphaNum4();
 
 // ================= STREAMS =================
 String urls[] = {
@@ -43,16 +49,256 @@ bool pendingStreamSwitch = false;
 bool muted = false;
 float currentGain = 1.0;
 
+// ================= DISPLAY STATE =================
+// Modes: SONG, MUTED, UNMUTED, VOLUME, LOADING
+enum DisplayMode { DISP_LOADING, DISP_SONG, DISP_MUTED, DISP_UNMUTED, DISP_VOLUME };
+DisplayMode displayMode = DISP_LOADING;
+
+String scrollText = "LOADING";       // text to scroll
+int scrollPos = 0;                   // current scroll offset (character index)
+unsigned long lastScrollTime = 0;
+unsigned long tempDisplayUntil = 0;  // for timed modes (UNMUTED, VOLUME)
+bool loadingBlink = false;
+unsigned long lastBlinkTime = 0;
+
+// metadata
+String currentSong = "";
+String currentArtist = "";
+unsigned long lastMetaFetch = 0;
+#define META_INTERVAL 10000  // fetch metadata every 10s
+
+// ================= DISPLAY HELPERS =================
+
+// Write exactly 4 chars to the display (pad with spaces)
+void writeDisplay4(const char *s) {
+  char buf[4] = {' ', ' ', ' ', ' '};
+  for (int i = 0; i < 4 && s[i] != '\0'; i++) buf[i] = s[i];
+  for (int i = 0; i < 4; i++) alpha4.writeDigitAscii(i, buf[i]);
+  alpha4.writeDisplay();
+}
+
+// Scroll a long string across 4 chars, advancing scrollPos
+// Returns true when one full pass is complete
+void tickScroll(const String &text) {
+  // Pad with spaces so it scrolls fully off both sides
+  String padded = "    " + text + "    ";
+  int len = padded.length();
+
+  if (scrollPos >= len - 4) scrollPos = 0;
+
+  char buf[5];
+  for (int i = 0; i < 4; i++) {
+    buf[i] = (scrollPos + i < len) ? padded[scrollPos + i] : ' ';
+  }
+  buf[4] = '\0';
+
+  writeDisplay4(buf);
+  scrollPos++;
+}
+
+void setScrollText(const String &text) {
+  scrollText = text;
+  scrollPos = 0;
+}
+
+// ================= METADATA =================
+// Fetches Icy stream title via a separate HTTP request with Icy-MetaData header.
+// Parses "StreamTitle='Artist - Song';" from the response.
+void fetchMetadata() {
+  if (!WiFi.isConnected()) return;
+
+  WiFiClientSecure metaClient;
+  metaClient.setInsecure();
+  metaClient.setTimeout(5);
+
+  // Parse host and path from url
+  String u = urls[urlIndex];
+  String host, path;
+  int port = 443;
+
+  // strip https://
+  String stripped = u;
+  if (stripped.startsWith("https://")) stripped = stripped.substring(8);
+  else if (stripped.startsWith("http://")) { stripped = stripped.substring(7); port = 80; }
+
+  int slash = stripped.indexOf('/');
+  if (slash < 0) {
+    host = stripped;
+    path = "/";
+  } else {
+    host = stripped.substring(0, slash);
+    path = stripped.substring(slash);
+  }
+
+  // Handle port in host
+  int colon = host.indexOf(':');
+  if (colon >= 0) {
+    port = host.substring(colon + 1).toInt();
+    host = host.substring(0, colon);
+  }
+
+  if (!metaClient.connect(host.c_str(), port)) {
+    Serial.println("Metadata connect failed");
+    return;
+  }
+
+  // Send HTTP GET with Icy-MetaData header
+  metaClient.printf("GET %s HTTP/1.0\r\nHost: %s\r\nIcy-MetaData: 1\r\nUser-Agent: Arduino\r\nConnection: close\r\n\r\n",
+                    path.c_str(), host.c_str());
+
+  // Read response headers
+  unsigned long timeout = millis() + 5000;
+  int icyMetaInt = 0;
+  String icyLine = "";
+
+  while (metaClient.connected() && millis() < timeout) {
+    if (!metaClient.available()) { delay(1); continue; }
+    char c = metaClient.read();
+    if (c == '\n') {
+      icyLine.trim();
+      if (icyLine.startsWith("icy-metaint:")) {
+        icyMetaInt = icyLine.substring(12).toInt();
+      }
+      if (icyLine.length() == 0) break; // end of headers
+      icyLine = "";
+    } else if (c != '\r') {
+      icyLine += c;
+    }
+  }
+
+  if (icyMetaInt <= 0) {
+    Serial.println("No icy-metaint in headers");
+    metaClient.stop();
+    return;
+  }
+
+  // Skip icyMetaInt bytes of audio data
+  int skipped = 0;
+  timeout = millis() + 8000;
+  while (skipped < icyMetaInt && millis() < timeout) {
+    if (metaClient.available()) { metaClient.read(); skipped++; }
+    else delay(1);
+  }
+
+  // Read metadata length byte
+  timeout = millis() + 3000;
+  while (!metaClient.available() && millis() < timeout) delay(1);
+  if (!metaClient.available()) { metaClient.stop(); return; }
+
+  int metaLen = metaClient.read() * 16;
+  if (metaLen == 0) { metaClient.stop(); return; }
+
+  // Read metadata block
+  String metaBlock = "";
+  timeout = millis() + 3000;
+  int read = 0;
+  while (read < metaLen && millis() < timeout) {
+    if (metaClient.available()) { metaBlock += (char)metaClient.read(); read++; }
+    else delay(1);
+  }
+
+  metaClient.stop();
+
+  Serial.println("Metadata block: " + metaBlock);
+
+  // Parse StreamTitle='...';
+  int start = metaBlock.indexOf("StreamTitle='");
+  if (start < 0) return;
+  start += 13;
+  int end = metaBlock.indexOf("';", start);
+  if (end < 0) return;
+
+  String title = metaBlock.substring(start, end);
+  title.trim();
+
+  Serial.println("Stream title: " + title);
+
+  // Try splitting "Artist - Song"
+  int dash = title.indexOf(" - ");
+  if (dash >= 0) {
+    currentArtist = title.substring(0, dash);
+    currentSong = title.substring(dash + 3);
+  } else {
+    currentArtist = "";
+    currentSong = title;
+  }
+
+  // Build scroll string: "ARTIST - SONG"
+  String full = (currentArtist.length() > 0)
+    ? (currentArtist + " - " + currentSong)
+    : currentSong;
+
+  full.toUpperCase();
+  setScrollText(full);
+
+  if (displayMode == DISP_LOADING || displayMode == DISP_SONG) {
+    displayMode = DISP_SONG;
+  }
+}
+
+// ================= DISPLAY TICK =================
+void tickDisplay() {
+  unsigned long now = millis();
+
+  // Check if timed display (UNMUTED / VOLUME) has expired
+  if ((displayMode == DISP_UNMUTED || displayMode == DISP_VOLUME) && now >= tempDisplayUntil) {
+    displayMode = (scrollText.length() > 0) ? DISP_SONG : DISP_LOADING;
+    scrollPos = 0;
+  }
+
+  switch (displayMode) {
+
+    case DISP_LOADING:
+      // Blink "LOAD" on and off every 500ms
+      if (now - lastBlinkTime >= 500) {
+        lastBlinkTime = now;
+        loadingBlink = !loadingBlink;
+        if (loadingBlink) writeDisplay4("LOAD");
+        else {
+          alpha4.clear();
+          alpha4.writeDisplay();
+        }
+      }
+      break;
+
+    case DISP_SONG:
+      // Scroll artist/song at ~250ms per step
+      if (now - lastScrollTime >= 250) {
+        lastScrollTime = now;
+        tickScroll(scrollText);
+      }
+      break;
+
+    case DISP_MUTED:
+      // Static "MUTE"
+      writeDisplay4("MUTE");
+      break;
+
+    case DISP_UNMUTED: {
+      // Static "UNMUTE" — only 4 chars fit so show "UNMT"
+      writeDisplay4("UNMT");
+      break;
+    }
+
+    case DISP_VOLUME: {
+      // Show volume as a percentage e.g. " 75%"
+      int pct = (int)(currentGain * 100.0f);
+      char buf[5];
+      snprintf(buf, sizeof(buf), "%3d%%", pct);
+      writeDisplay4(buf);
+      break;
+    }
+  }
+}
+
 // ================= WIFI =================
 void ConnectWiFi() {
   Serial.print("Connecting WiFi...");
   WiFi.begin(ssid);
-
   while (!WiFi.isConnected()) {
     delay(100);
     Serial.print(".");
   }
-
   Serial.println("\nWiFi connected");
 }
 
@@ -81,13 +327,19 @@ void startStream() {
     return;
   }
 
-  // Seed gain from station default, respect mute state
   currentGain = gains[urlIndex];
   mp3.setGain(muted ? 0.0 : currentGain);
 
   streamActive = true;
   lastAudioData = millis();
   Serial.println("Stream started OK");
+
+  // Reset metadata so it fetches fresh for this station
+  currentSong = "";
+  currentArtist = "";
+  setScrollText("LOADING");
+  displayMode = DISP_LOADING;
+  lastMetaFetch = 0;  // force immediate fetch on next loop
 }
 
 // ================= RADIO LOOP =================
@@ -102,12 +354,10 @@ void runRadio() {
   if (available <= 0) return;
 
   size_t len = min((size_t)512, (size_t)available);
-
   int r = stream->read(buff, len);
   if (r <= 0) return;
 
   lastAudioData = millis();
-
   mp3.write(buff, r);
 
   if (mp3.available() < 1024) mp3.pause();
@@ -115,11 +365,8 @@ void runRadio() {
 }
 
 // ================= COMMAND HANDLER =================
-// NOTE: This runs inside a BLE notify callback — do NOT call HTTPClient
-// or WiFiClient here. Only set flags and update simple state.
 void handleCommand(String val) {
   val.trim();
-
   Serial.println("BLE Command: " + val);
 
   if (val == "FRONT") {
@@ -134,6 +381,12 @@ void handleCommand(String val) {
   if (val == "BACK") {
     muted = !muted;
     mp3.setGain(muted ? 0.0 : currentGain);
+    if (muted) {
+      displayMode = DISP_MUTED;
+    } else {
+      displayMode = DISP_UNMUTED;
+      tempDisplayUntil = millis() + 2000;
+    }
     Serial.println(muted ? "MUTED" : "UNMUTED");
     return;
   }
@@ -141,6 +394,8 @@ void handleCommand(String val) {
   if (val == "LEFT") {
     currentGain = max(0.0f, currentGain - 0.25f);
     if (!muted) mp3.setGain(currentGain);
+    displayMode = DISP_VOLUME;
+    tempDisplayUntil = millis() + 2000;
     Serial.printf("Volume down: %.2f\n", currentGain);
     return;
   }
@@ -148,6 +403,8 @@ void handleCommand(String val) {
   if (val == "RIGHT") {
     currentGain = min(1.0f, currentGain + 0.25f);
     if (!muted) mp3.setGain(currentGain);
+    displayMode = DISP_VOLUME;
+    tempDisplayUntil = millis() + 2000;
     Serial.printf("Volume up: %.2f\n", currentGain);
     return;
   }
@@ -161,13 +418,11 @@ void handleCommand(String val) {
 // ================= BLE CALLBACK =================
 void notify(BLERemoteCharacteristic *c, const uint8_t *data, uint32_t len) {
   String val;
-
   for (uint32_t i = 0; i < len; i++) {
     char ch = (char)data[i];
     if (ch == '\r' || ch == '\n') continue;
     val += ch;
   }
-
   handleCommand(val);
 }
 
@@ -220,6 +475,11 @@ void handleBLE() {
 void setup() {
   Serial.begin(115200);
 
+  Wire.begin();
+  alpha4.begin(0x70);
+  alpha4.clear();
+  alpha4.writeDisplay();
+
   mp3.begin();
   mp3.setGain(1.0);
 
@@ -228,17 +488,24 @@ void setup() {
 
   BLE.begin();
 
-  Serial.println("System Ready (Audio + BLE active)");
+  Serial.println("System Ready (Audio + BLE + Display active)");
 }
 
 // ================= LOOP =================
 void loop() {
-  // Handle deferred stream switch from BLE callback
+  // Deferred stream switch from BLE callback
   if (pendingStreamSwitch) {
     pendingStreamSwitch = false;
     startStream();
   }
 
+  // Periodic metadata fetch (skip if a timed display is active)
+  if (streamActive && (millis() - lastMetaFetch >= META_INTERVAL)) {
+    lastMetaFetch = millis();
+    fetchMetadata();
+  }
+
   runRadio();
   handleBLE();
+  tickDisplay();
 }
