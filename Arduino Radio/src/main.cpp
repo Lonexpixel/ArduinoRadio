@@ -1,176 +1,244 @@
-#include <BackgroundAudioSpeech.h>
-#include <libespeak-ng/voice/en_029.h>
-#include <libespeak-ng/voice/en_gb_scotland.h>
-#include <libespeak-ng/voice/en_gb_x_gbclan.h>
-#include <libespeak-ng/voice/en_gb_x_gbcwmd.h>
-#include <libespeak-ng/voice/en_gb_x_rp.h>
-#include <libespeak-ng/voice/en.h>
-#include <libespeak-ng/voice/en_shaw.h>
-#include <libespeak-ng/voice/en_us.h>
-#include <libespeak-ng/voice/en_us_nyc.h>
-BackgroundAudioVoice v[] = {
-  voice_en_029,
-  voice_en_gb_scotland,
-  voice_en_gb_x_gbclan,
-  voice_en_gb_x_gbcwmd,
-  voice_en,
-  voice_en_shaw,
-  voice_en_us,
-  voice_en_us_nyc
-};
- 
+#include <Arduino.h>
+#include <BLE.h>
+#include <Adafruit_NeoPixel.h>
+
 #include <I2S.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <BackgroundAudio.h>
-#include <WebServer.h>
-#include <Adafruit_NeoPixel.h>
 
-// ================= UUIDs (FROM YOUR FIRST FILE) =================
+// ================= WIFI =================
+const char *ssid = "MUSTANG";
+
+// ================= BLE UUIDS =================
 const char *serviceUUID = "b44eb0b6-da3c-4ebf-a680-01a487661ac5";
 const char *strDataUUID = "b44eb0b6-da3c-4ebf-a680-01a487661ac8";
 
-// ================= HARDWARE =================
-#define NEO_PIN 19
-#define NEO_COUNT 5
+// ================= AUDIO =================
+#define STREAMBUFF 16384
 
-Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
+I2S audio(OUTPUT, 26, 21);
+BackgroundAudioMP3Class<RawDataBuffer<STREAMBUFF>> mp3(audio);
+
+WiFiClientSecure *client = nullptr;
+HTTPClient http;
+uint8_t buff[512];
+
+// ================= STREAMS =================
+String urls[] = {
+  "https://pureplay.cdnstream1.com/6021_128.mp3",
+  "https://live.amperwave.net/direct/townsquare-ktrsfmmp3-ibc3.mp3",
+  "https://uzic.ice.infomaniak.ch/uzic-128.mp3"
+};
+
+float gains[] = {1.0, 0.3, 0.3};
+int urlIndex = 0;
+String url = urls[0];
 
 // ================= STATE =================
-bool loggedIn = false;
-String lastCommand = "";
+bool streamActive = false;
+bool bleConnected = false;
+unsigned long lastAudioData = 0;
+bool pendingStreamSwitch = false;
+bool muted = false;
+float currentGain = 1.0;
 
-// ================= COLORS =================
-uint32_t BLUE, YELLOW, PURPLE, ORANGE, GREEN, OFF;
+// ================= WIFI =================
+void ConnectWiFi() {
+  Serial.print("Connecting WiFi...");
+  WiFi.begin(ssid);
 
-// ================= HELPERS =================
-void setAll(uint32_t color) {
-  for (int i = 0; i < NEO_COUNT; i++) {
-    strip.setPixelColor(i, color);
+  while (!WiFi.isConnected()) {
+    delay(100);
+    Serial.print(".");
   }
-  strip.show();
+
+  Serial.println("\nWiFi connected");
+}
+
+// ================= STREAM =================
+void startStream() {
+  http.end();
+
+  if (client) {
+    delete client;
+    client = nullptr;
+  }
+
+  client = new WiFiClientSecure();
+  client->setInsecure();
+
+  Serial.printf("Connecting stream: %s\n", url.c_str());
+
+  http.begin(*client, url);
+  http.setReuse(false);
+
+  int code = http.GET();
+
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("Stream failed (HTTP error %d)\n", code);
+    streamActive = false;
+    return;
+  }
+
+  // Seed gain from station default, respect mute state
+  currentGain = gains[urlIndex];
+  mp3.setGain(muted ? 0.0 : currentGain);
+
+  streamActive = true;
+  lastAudioData = millis();
+  Serial.println("Stream started OK");
+}
+
+// ================= RADIO LOOP =================
+void runRadio() {
+  if (!WiFi.isConnected()) return;
+  if (!streamActive) return;
+
+  WiFiClient *stream = http.getStreamPtr();
+  if (!stream) return;
+
+  int available = stream->available();
+  if (available <= 0) return;
+
+  size_t len = min((size_t)512, (size_t)available);
+
+  int r = stream->read(buff, len);
+  if (r <= 0) return;
+
+  lastAudioData = millis();
+
+  mp3.write(buff, r);
+
+  if (mp3.available() < 1024) mp3.pause();
+  else if (mp3.paused() && mp3.available() > STREAMBUFF / 2) mp3.unpause();
 }
 
 // ================= COMMAND HANDLER =================
+// NOTE: This runs inside a BLE notify callback — do NOT call HTTPClient
+// or WiFiClient here. Only set flags and update simple state.
 void handleCommand(String val) {
-  Serial.print("Received: ");
-  Serial.println(val);
+  val.trim();
 
-  if (val == lastCommand) return;
-  lastCommand = val;
+  Serial.println("BLE Command: " + val);
+
+  if (val == "FRONT") {
+    Serial.println("Switching station...");
+    streamActive = false;
+    urlIndex = (urlIndex + 1) % 3;
+    url = urls[urlIndex];
+    pendingStreamSwitch = true;
+    return;
+  }
+
+  if (val == "BACK") {
+    muted = !muted;
+    mp3.setGain(muted ? 0.0 : currentGain);
+    Serial.println(muted ? "MUTED" : "UNMUTED");
+    return;
+  }
+
+  if (val == "LEFT") {
+    currentGain = max(0.0f, currentGain - 0.25f);
+    if (!muted) mp3.setGain(currentGain);
+    Serial.printf("Volume down: %.2f\n", currentGain);
+    return;
+  }
+
+  if (val == "RIGHT") {
+    currentGain = min(1.0f, currentGain + 0.25f);
+    if (!muted) mp3.setGain(currentGain);
+    Serial.printf("Volume up: %.2f\n", currentGain);
+    return;
+  }
 
   if (val == "LOGIN") {
-    loggedIn = true;
-    Serial.println("User Logged In");
-    setAll(GREEN);
+    Serial.println("User logged in");
     return;
   }
-
-  if (val == "LOGOUT") {
-    loggedIn = false;
-    Serial.println("User Logged Out");
-    setAll(OFF);
-    return;
-  }
-
-  if (!loggedIn) return;
-
-  if (val == "LEFT") setAll(BLUE);
-  else if (val == "RIGHT") setAll(YELLOW);
-  else if (val == "FRONT") setAll(PURPLE);
-  else if (val == "BACK") setAll(ORANGE);
 }
 
-// ================= NOTIFY CALLBACK =================
+// ================= BLE CALLBACK =================
 void notify(BLERemoteCharacteristic *c, const uint8_t *data, uint32_t len) {
-  String val = "";
+  String val;
+
   for (uint32_t i = 0; i < len; i++) {
-    val += (char)data[i];
+    char ch = (char)data[i];
+    if (ch == '\r' || ch == '\n') continue;
+    val += ch;
   }
 
   handleCommand(val);
 }
 
-uint32_t cnt = 1;
+// ================= BLE STATE =================
+unsigned long lastScan = 0;
 
-void setup() {
-  Serial.begin(115200);
-  delay(3000);
-
-  Serial.println("Client Receiver Starting...");
-
-  // NeoPixel init
-  strip.begin();
-  strip.setBrightness(50);
-
-  BLUE   = strip.Color(0,0,255);
-  YELLOW = strip.Color(255,255,0);
-  PURPLE = strip.Color(128,0,128);
-  ORANGE = strip.Color(255,140,0);
-  GREEN  = strip.Color(0,255,0);
-  OFF    = strip.Color(0,0,0);
-
-  setAll(OFF);
-
-  // BLE as CLIENT
-  BLE.begin();
-  Serial.println("BLE Client started");
-}
-
-void loop() {
-  Serial.printf("Scanning %d...\n", cnt++);
-
-  auto report = BLE.scan(BLEUUID(serviceUUID), 5);
-
-  if (report->empty()) {
-    Serial.println("No devices found, retrying...");
-    delay(3000);
+void handleBLE() {
+  if (BLE.client()->connected()) {
+    bleConnected = true;
     return;
   }
 
-  BLEAdvertising device = report->front();
+  bleConnected = false;
 
-  Serial.print("Connecting to: ");
-  Serial.println(device.toString());
+  if (millis() - lastScan < 2000) return;
+  lastScan = millis();
 
-  if (!BLE.client()->connect(device, 10)) {
-    Serial.println("Connection failed");
-    delay(3000);
+  auto report = BLE.scan(BLEUUID(serviceUUID), 3);
+  if (!report || report->empty()) return;
+
+  BLEAdvertising dev = report->front();
+
+  if (!BLE.client()->connect(dev, 5)) {
+    Serial.println("BLE connect failed");
     return;
   }
-
-  Serial.println("CONNECTED");
 
   auto svc = BLE.client()->service(BLEUUID(serviceUUID));
   if (!svc) {
-    Serial.println("Service not found");
+    Serial.println("BLE service missing → disconnect");
     BLE.client()->disconnect();
     return;
   }
 
-  auto strData = svc->characteristic(BLEUUID(strDataUUID));
-  if (!strData) {
-    Serial.println("Characteristic not found");
+  auto ch = svc->characteristic(BLEUUID(strDataUUID));
+  if (!ch) {
+    Serial.println("BLE characteristic missing → disconnect");
     BLE.client()->disconnect();
     return;
   }
 
-  // Enable notifications
-  Serial.println("Enabling notifications...");
-  strData->onNotify(notify);
-  strData->enableNotifications();
+  ch->onNotify(notify);
+  ch->enableNotifications();
 
-  // Initial read (optional)
-  String initial = strData->getString();
-  if (initial.length()) {
-    handleCommand(initial);
+  bleConnected = true;
+  Serial.println("BLE FULLY CONNECTED (verified)");
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  mp3.begin();
+  mp3.setGain(1.0);
+
+  ConnectWiFi();
+  startStream();
+
+  BLE.begin();
+
+  Serial.println("System Ready (Audio + BLE active)");
+}
+
+// ================= LOOP =================
+void loop() {
+  // Handle deferred stream switch from BLE callback
+  if (pendingStreamSwitch) {
+    pendingStreamSwitch = false;
+    startStream();
   }
 
-  // Stay connected and receive data
-  while (BLE.client()->connected()) {
-    delay(100);
-  }
-
-  Serial.println("DISCONNECTED");
-  delay(2000);
+  runRadio();
+  handleBLE();
 }
