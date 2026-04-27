@@ -54,8 +54,7 @@ const unsigned long SEND_COOLDOWN = 3000; // 3 seconds
 
 // ================= ORIENTATION =================
 enum Orientation { LEFT, RIGHT, FRONT, BACK, NONE };
-Orientation lastOrientation = NONE;
-const float THRESHOLD = 7.5; // MUCH less sensitive (near 90° tilt)
+const float THRESHOLD = 7.5;
 
 // ================= HELPERS =================
 void setPixel(uint32_t c) {
@@ -151,7 +150,7 @@ void setup() {
 // ================= LOOP =================
 void loop() {
 
-  // ===== KEY INPUT =====
+  // ===== KEYPAD =====
   keypad1.updateFIFO();
   char key = keypad1.getButton();
 
@@ -159,12 +158,9 @@ void loop() {
 
     Serial.print("Key: ");
 
-    // MASK INPUT
-    if (currentUser == -1) {
-      Serial.print("*");
-    } else {
-      Serial.print(key);
-    }
+    if (currentUser == -1) Serial.print("*");
+    else Serial.print(key);
+
     Serial.println();
 
     // LOGOUT (***)
@@ -187,10 +183,11 @@ void loop() {
       starPress = 0;
     }
 
-    // SUBMIT
+    // LOGIN SUBMIT
     if (key == '#') {
       if (currentUser == -1 && entryIndex == 4) {
         int user = checkUser();
+
         if (user != -1) {
           currentUser = user;
           Serial.print("✅ LOGIN: ");
@@ -211,17 +208,18 @@ void loop() {
           setPixel(RED);
         }
       }
+
       clearEntry();
       return;
     }
 
-    // STORE INPUT (HIDDEN)
+    // STORE PIN (HIDDEN)
     if (currentUser == -1 && entryIndex < 4) {
       userEntry[entryIndex++] = key;
     }
   }
 
-  // ===== IMU (ONLY IF LOGGED IN) =====
+  // ===== IMU CONTROL =====
   if (currentUser != -1 && bleConnected) {
 
     sensors_event_t accel, gyro, temp;
@@ -232,7 +230,7 @@ void loop() {
 
     Orientation current = NONE;
 
-    // MUST be near 90° tilt (strong threshold)
+    // MUST tilt close to 90°
     if (abs(ax) > abs(ay) + THRESHOLD)
       current = (ax > 0) ? RIGHT : LEFT;
     else if (abs(ay) > abs(ax) + THRESHOLD)
@@ -240,16 +238,15 @@ void loop() {
 
     unsigned long now = millis();
 
+    // ✅ ONLY cooldown controls sending (repeats allowed)
     if (current != NONE &&
-        current != lastOrientation &&
         (now - lastSendTime > SEND_COOLDOWN)) {
 
-      if (current == LEFT)  { setPixel(BLUE); sendDirection("LEFT"); }
+      if (current == LEFT)  { setPixel(BLUE);   sendDirection("LEFT"); }
       if (current == RIGHT) { setPixel(YELLOW); sendDirection("RIGHT"); }
       if (current == FRONT) { setPixel(PURPLE); sendDirection("FRONT"); }
       if (current == BACK)  { setPixel(ORANGE); sendDirection("BACK"); }
 
-      lastOrientation = current;
       lastSendTime = now;
     }
   }
