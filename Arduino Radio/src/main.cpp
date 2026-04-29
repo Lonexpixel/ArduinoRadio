@@ -1,13 +1,11 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <SPI.h>
 #include <BLE.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_LSM6DSOX.h>
 #include <Adafruit_NeoPixel.h>
 #include "SparkFun_Qwiic_Keypad_Arduino_Library.h"
 
-// ================= CONFIG =================
 #define NEO_PIN 28
 #define NEO_COUNT 1
 
@@ -15,7 +13,6 @@ Adafruit_NeoPixel strip(NEO_COUNT, NEO_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_LSM6DSOX imu;
 KEYPAD keypad1;
 
-// ================= BLE UUIDs =================
 BLEService service(BLEUUID(String("b44eb0b6-da3c-4ebf-a680-01a487661ac5")));
 
 BLECharacteristic strData(
@@ -24,39 +21,32 @@ BLECharacteristic strData(
   "Direction Data"
 );
 
-// ================= USERS =================
 const char keyCodes[4][4] = {
-  {'6','9','6','9'}, // Dylan
-  {'1','1','1','1'}, // Rocky
-  {'0','4','2','0'}, // Nicholas
-  {'6','7','6','7'}  // John
+  {'6','9','6','9'},
+  {'1','1','1','1'},
+  {'0','4','2','0'},
+  {'6','7','6','7'}
 };
 
 const char* userNames[4] = {
   "Dylan","Rocky","Nicholas","John"
 };
 
-// ================= STATE =================
 char userEntry[4] = {0};
 byte entryIndex = 0;
 int currentUser = -1;
 int starPress = 0;
 
-// ================= COLORS =================
 uint32_t GREEN, BLUE, RED, YELLOW, PURPLE, ORANGE, OFF;
 
-// ================= BLE STATE =================
 bool bleConnected = false;
 
-// ================= TIMING =================
 unsigned long lastSendTime = 0;
-const unsigned long SEND_COOLDOWN = 3000; // 3 seconds
+const unsigned long SEND_COOLDOWN = 3000;
 
-// ================= ORIENTATION =================
 enum Orientation { LEFT, RIGHT, FRONT, BACK, NONE };
 const float THRESHOLD = 7.5;
 
-// ================= HELPERS =================
 void setPixel(uint32_t c) {
   strip.setPixelColor(0, c);
   strip.show();
@@ -64,13 +54,11 @@ void setPixel(uint32_t c) {
 
 void sendDirection(const char* dir) {
   if (!bleConnected) return;
-
   strData.setValue(dir);
-  Serial.print("📡 Sent: ");
+  Serial.print("Sent: ");
   Serial.println(dir);
 }
 
-// ================= LOGIN CHECK =================
 int checkUser() {
   for (int u = 0; u < 4; u++) {
     bool match = true;
@@ -87,23 +75,21 @@ void clearEntry() {
   entryIndex = 0;
 }
 
-// ================= BLE CALLBACK =================
 class MyCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
     bleConnected = true;
-    Serial.println("🔵 CONNECTED to receiver");
+    Serial.println("CONNECTED");
     setPixel(GREEN);
   }
 
   void onDisconnect(BLEServer* pServer) {
     bleConnected = false;
-    Serial.println("🔴 DISCONNECTED from receiver");
+    Serial.println("DISCONNECTED");
     BLE.startAdvertising();
     setPixel(OFF);
   }
 };
 
-// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
   delay(1500);
@@ -123,52 +109,42 @@ void setup() {
 
   setPixel(RED);
 
-  // IMU
   if (!imu.begin_I2C(0x6B)) {
-    Serial.println("IMU NOT FOUND");
+    Serial.println("IMU FAIL");
     while (1);
   }
 
-  // Keypad
   keypad1.begin();
 
-  // BLE
   BLE.setSecurity(BLESecurityJustWorks);
   BLE.begin("SenderBoard");
 
   service.addCharacteristic(&strData);
   BLE.server()->addService(&service);
+
   strData.setValue("READY");
 
   BLE.server()->setCallbacks(new MyCallbacks());
 
   BLE.startAdvertising();
 
-  Serial.println("🟡 Waiting for receiver...");
+  Serial.println("WAITING");
 }
 
-// ================= LOOP =================
 void loop() {
-
-  // ===== KEYPAD =====
   keypad1.updateFIFO();
   char key = keypad1.getButton();
 
   if (key) {
 
-    Serial.print("Key: ");
+    // Completely hide PIN input
+    if (currentUser == -1 && key != '#' && key != '*') {
+      Serial.println("*");
+    }
 
-    if (currentUser == -1) Serial.print("*");
-    else Serial.print(key);
-
-    Serial.println();
-
-    // LOGOUT (***)
     if (key == '*') {
       starPress++;
-
       if (starPress >= 3) {
-        Serial.println("🚪 LOGOUT");
         currentUser = -1;
         clearEntry();
         setPixel(OFF);
@@ -176,52 +152,53 @@ void loop() {
         starPress = 0;
         return;
       }
-
       clearEntry();
       return;
     } else {
       starPress = 0;
     }
 
-    // LOGIN SUBMIT
     if (key == '#') {
-      if (currentUser == -1 && entryIndex == 4) {
+
+      if (currentUser == -1) {
+
+        if (entryIndex < 4) {
+          Serial.println("PIN TOO SHORT");
+          return;
+        }
+
         int user = checkUser();
 
         if (user != -1) {
           currentUser = user;
-          Serial.print("✅ LOGIN: ");
           Serial.println(userNames[user]);
 
           setPixel(GREEN);
           sendDirection("LOGIN");
 
-          // pattern flash 2x
           for (int i = 0; i < 2; i++) {
             setPixel(YELLOW); delay(150);
             setPixel(PURPLE); delay(150);
             setPixel(YELLOW); delay(150);
             setPixel(PURPLE); delay(150);
           }
+
         } else {
-          Serial.println("❌ WRONG PIN");
+          Serial.println("WRONG PIN");
           setPixel(RED);
+          clearEntry();
         }
       }
 
-      clearEntry();
       return;
     }
 
-    // STORE PIN (HIDDEN)
     if (currentUser == -1 && entryIndex < 4) {
       userEntry[entryIndex++] = key;
     }
   }
 
-  // ===== IMU CONTROL =====
   if (currentUser != -1 && bleConnected) {
-
     sensors_event_t accel, gyro, temp;
     imu.getEvent(&accel, &gyro, &temp);
 
@@ -230,7 +207,6 @@ void loop() {
 
     Orientation current = NONE;
 
-    // MUST tilt close to 90°
     if (abs(ax) > abs(ay) + THRESHOLD)
       current = (ax > 0) ? RIGHT : LEFT;
     else if (abs(ay) > abs(ax) + THRESHOLD)
@@ -238,9 +214,7 @@ void loop() {
 
     unsigned long now = millis();
 
-    // ✅ ONLY cooldown controls sending (repeats allowed)
-    if (current != NONE &&
-        (now - lastSendTime > SEND_COOLDOWN)) {
+    if (current != NONE && (now - lastSendTime > SEND_COOLDOWN)) {
 
       if (current == LEFT)  { setPixel(BLUE);   sendDirection("LEFT"); }
       if (current == RIGHT) { setPixel(YELLOW); sendDirection("RIGHT"); }
